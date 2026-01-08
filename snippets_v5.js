@@ -1,6 +1,6 @@
 import { connect } from 'cloudflare:sockets';
 
-// ============ 类型稳定常量 ============
+// ============ 预编译常量 ============
 const UUID = new Uint8Array([
   0x55, 0xd9, 0xec, 0x38, 0x1b, 0x8a, 0x45, 0x4b,
   0x98, 0x1a, 0x6a, 0xcf, 0xe8, 0xf5, 0x6d, 0x8c
@@ -13,16 +13,17 @@ const ATYPE_DOMAIN = 2;
 const ATYPE_IPV6 = 3;
 
 const WS_HIGH_WATER = 32768;
-const WS_BACKOFF_MS = 2;
-const CONNECT_TIMEOUT = 3000;
+const BATCH_SIZE = 8;
+const BATCH_BYTES = 65536;
+const CONNECT_TIMEOUT = 2000;
 
 const textDecoder = new TextDecoder();
 const EMPTY_BYTES = new Uint8Array(0);
 
-// ============ 单态对象工厂（固定形状） ============
+// ============ 单态对象工厂 ============
 function ParseResult(host, end, ok) {
   this.host = host;
-  this.end = end | 0;      // SMI优化
+  this.end = end | 0;
   this.ok = !!ok;
 }
 
@@ -34,14 +35,13 @@ function DecodeResult(data, ok) {
 const PARSE_FAIL = Object.freeze(new ParseResult('', 0, false));
 const DECODE_FAIL = Object.freeze(new DecodeResult(null, false));
 
-// ============ 预编译响应（避免闭包） ============
 const RESP_101 = (ws) => new Response(null, { status: 101, webSocket: ws });
 const RESP_400 = new Response(null, { status: 400 });
 const RESP_403 = new Response(null, { status: 403 });
 const RESP_426 = new Response(null, { status: 426, headers: { Upgrade: 'websocket' } });
 const RESP_502 = new Response(null, { status: 502 });
 
-// ============ Base64 解码（类型稳定） ============
+// ============ Base64 解码 ============
 function decodeBase64(str) {
   const cleaned = str.replace(/-/g, '+').replace(/_/g, '/');
   let binary;
@@ -55,20 +55,21 @@ function decodeBase64(str) {
   const arr = new Uint8Array(len);
   const end4 = len & ~3;
   
-  for (let i = 0; i < end4; i += 4) {
+  let i = 0;
+  for (; i < end4; i += 4) {
     arr[i] = binary.charCodeAt(i);
     arr[i + 1] = binary.charCodeAt(i + 1);
     arr[i + 2] = binary.charCodeAt(i + 2);
     arr[i + 3] = binary.charCodeAt(i + 3);
   }
-  for (let i = end4; i < len; i++) {
+  for (; i < len; i = i + 1 | 0) {
     arr[i] = binary.charCodeAt(i);
   }
   
   return new DecodeResult(arr, true);
 }
 
-// ============ UUID 验证（位运算单态） ============
+// ============ UUID 验证 ============
 function verifyUUID(data, offset) {
   const o = offset | 0;
   return (
@@ -83,26 +84,26 @@ function verifyUUID(data, offset) {
   );
 }
 
-// ============ 地址解析（分支预测友好） ============
+// ============ 地址解析 ============
 function parseAddress(data, offset, dataLen) {
-  const atype = data[offset];
+  const atype = data[offset] | 0;
   const o = offset | 0;
 
   if (atype === ATYPE_IPV4) {
-    const end = o + 5;
+    const end = o + 5 | 0;
     if (end > dataLen) return PARSE_FAIL;
-    const o1 = o + 1;
-    return new ParseResult(
-      `${data[o1]}.${data[o1 + 1]}.${data[o1 + 2]}.${data[o1 + 3]}`,
-      end,
-      true
-    );
+    const o1 = o + 1 | 0;
+    const a = data[o1] | 0;
+    const b = data[o1 + 1] | 0;
+    const c = data[o1 + 2] | 0;
+    const d = data[o1 + 3] | 0;
+    return new ParseResult(`${a}.${b}.${c}.${d}`, end, true);
   }
 
   if (atype === ATYPE_DOMAIN) {
     if (o + 2 > dataLen) return PARSE_FAIL;
     const domainLen = data[o + 1] | 0;
-    const end = o + 2 + domainLen;
+    const end = o + 2 + domainLen | 0;
     if (end > dataLen) return PARSE_FAIL;
     return new ParseResult(
       textDecoder.decode(data.subarray(o + 2, end)),
@@ -112,29 +113,32 @@ function parseAddress(data, offset, dataLen) {
   }
 
   if (atype === ATYPE_IPV6) {
-    const end = o + 17;
+    const end = o + 17 | 0;
     if (end > dataLen) return PARSE_FAIL;
     const dv = new DataView(data.buffer, data.byteOffset + o + 1, 16);
-    const parts = [
-      dv.getUint16(0).toString(16),
-      dv.getUint16(2).toString(16),
-      dv.getUint16(4).toString(16),
-      dv.getUint16(6).toString(16),
-      dv.getUint16(8).toString(16),
-      dv.getUint16(10).toString(16),
-      dv.getUint16(12).toString(16),
-      dv.getUint16(14).toString(16)
-    ];
-    return new ParseResult(parts.join(':'), end, true);
+    const p0 = dv.getUint16(0).toString(16);
+    const p1 = dv.getUint16(2).toString(16);
+    const p2 = dv.getUint16(4).toString(16);
+    const p3 = dv.getUint16(6).toString(16);
+    const p4 = dv.getUint16(8).toString(16);
+    const p5 = dv.getUint16(10).toString(16);
+    const p6 = dv.getUint16(12).toString(16);
+    const p7 = dv.getUint16(14).toString(16);
+    return new ParseResult(
+      `${p0}:${p1}:${p2}:${p3}:${p4}:${p5}:${p6}:${p7}`,
+      end,
+      true
+    );
   }
 
   return PARSE_FAIL;
 }
 
-// ============ 超时控制（避免闭包捕获） ============
+// ============ 超时控制 ============
 function withTimeout(promise, ms) {
+  let tid = 0;
   return new Promise((resolve, reject) => {
-    const tid = setTimeout(reject, ms);
+    tid = setTimeout(reject, ms);
     promise.then(
       (v) => { clearTimeout(tid); resolve(v); },
       (e) => { clearTimeout(tid); reject(e); }
@@ -171,6 +175,8 @@ State.prototype.shutdown = function() {
   this.closed = true;
   const ws = this.ws;
   const tcp = this.tcp;
+  this.ws = null;
+  this.tcp = null;
   if (ws !== null) {
     try { ws.close(); } catch {}
   }
@@ -184,71 +190,162 @@ const VLESS_RESPONSE_HEADER = new Uint8Array([0x00, 0x00]);
 
 function buildFirstFrame(chunk) {
   const chunkLen = chunk.length | 0;
-  const frame = new Uint8Array(2 + chunkLen);
+  const frameLen = 2 + chunkLen | 0;
+  const frame = new Uint8Array(frameLen);
   frame[0] = 0x00;
   frame[1] = 0x00;
   frame.set(chunk, 2);
   return frame;
 }
 
+// ============ 上行管道上下文（固定形状） ============
+function UplinkContext(state, writer) {
+  this.state = state;
+  this.writer = writer;
+  this.queue = [];
+  this.flushScheduled = false;
+}
+
+UplinkContext.prototype.scheduleFlush = function() {
+  if (!this.flushScheduled) {
+    this.flushScheduled = true;
+    const self = this;
+    queueMicrotask(() => self.flush());
+  }
+};
+
+UplinkContext.prototype.flush = function() {
+  const state = this.state;
+  const queue = this.queue;
+  
+  if (state.closed || queue.length === 0) {
+    this.flushScheduled = false;
+    return;
+  }
+
+  let batchCount = 0;
+  let batchBytes = 0;
+  let i = 0;
+  
+  while (i < queue.length && batchCount < BATCH_SIZE) {
+    const chunkLen = queue[i].length | 0;
+    if (batchBytes + chunkLen > BATCH_BYTES && batchCount > 0) break;
+    batchBytes = batchBytes + chunkLen | 0;
+    batchCount = batchCount + 1 | 0;
+    i = i + 1 | 0;
+  }
+
+  const batch = queue.splice(0, batchCount);
+  
+  let payload;
+  if (batch.length === 1) {
+    payload = batch[0];
+  } else {
+    payload = new Uint8Array(batchBytes);
+    let offset = 0;
+    for (let j = 0; j < batch.length; j = j + 1 | 0) {
+      payload.set(batch[j], offset);
+      offset = offset + batch[j].length | 0;
+    }
+  }
+
+  const self = this;
+  this.writer.write(payload).then(
+    () => {
+      self.flushScheduled = false;
+      if (self.queue.length > 0 && !self.state.closed) {
+        self.scheduleFlush();
+      }
+    },
+    () => self.state.shutdown()
+  );
+};
+
+UplinkContext.prototype.push = function(chunk) {
+  if (!this.state.closed) {
+    this.queue.push(chunk);
+    this.scheduleFlush();
+  }
+};
+
 // ============ 上行管道 ============
 function createUplink(state, initial, writable) {
   const writer = writable.getWriter();
-  let chain = Promise.resolve();
-
-  function write(chunk) {
-    chain = chain.then(() => {
-      if (state.closed) return;
-      return writer.write(chunk);
-    }).catch(() => {
-      state.shutdown();
-    });
+  const ctx = new UplinkContext(state, writer);
+  
+  if (initial.length > 0) {
+    ctx.push(initial);
   }
 
-  if (initial.length > 0) write(initial);
-
   return function onMessage(ev) {
-    if (!state.closed) write(new Uint8Array(ev.data));
+    ctx.push(new Uint8Array(ev.data));
   };
 }
 
-// ============ 下行管道 ============
-function createDownlink(state, ws, readable) {
-  const reader = readable.getReader();
-  let first = true;
+// ============ 下行管道上下文（固定形状） ============
+function DownlinkContext(state, ws, reader) {
+  this.state = state;
+  this.ws = ws;
+  this.reader = reader;
+  this.first = true;
+  this.pending = null;
+  this.pumping = false;
+}
 
-  function pump() {
-    if (state.closed) {
-      try { reader.releaseLock(); } catch {}
+DownlinkContext.prototype.pump = function() {
+  if (this.pumping || this.state.closed) return;
+  this.pumping = true;
+  
+  const self = this;
+  function step() {
+    if (self.state.closed) {
+      self.pumping = false;
+      try { self.reader.releaseLock(); } catch {}
       return;
     }
 
-    if (ws.bufferedAmount > WS_HIGH_WATER) {
-      setTimeout(pump, WS_BACKOFF_MS);
+    const buffered = self.ws.bufferedAmount | 0;
+    if (buffered > WS_HIGH_WATER) {
+      queueMicrotask(step);
       return;
     }
 
-    reader.read().then(
+    const reading = self.pending || self.reader.read();
+    self.pending = null;
+
+    reading.then(
       (result) => {
-        if (result.done || state.closed) {
-          state.shutdown();
-          try { reader.releaseLock(); } catch {}
+        if (result.done || self.state.closed) {
+          self.pumping = false;
+          self.state.shutdown();
+          try { self.reader.releaseLock(); } catch {}
           return;
         }
 
-        const chunk = first ? buildFirstFrame(result.value) : result.value;
-        first = false;
-        ws.send(chunk);
-        pump();
+        self.pending = self.reader.read();
+
+        const chunk = self.first ? buildFirstFrame(result.value) : result.value;
+        self.first = false;
+        self.ws.send(chunk);
+
+        step();
       },
       () => {
-        state.shutdown();
-        try { reader.releaseLock(); } catch {}
+        self.pumping = false;
+        self.state.shutdown();
+        try { self.reader.releaseLock(); } catch {}
       }
     );
   }
 
-  pump();
+  step();
+};
+
+// ============ 下行管道 ============
+function createDownlink(state, ws, readable) {
+  const reader = readable.getReader();
+  const ctx = new DownlinkContext(state, ws, reader);
+  ctx.pump();
 }
 
 // ============ VLESS协议解析 ============
@@ -259,7 +356,7 @@ function parseVLESSRequest(data) {
   if (!verifyUUID(data, 1)) return null;
 
   const addonsLen = data[17] | 0;
-  const cmdOffset = (18 + addonsLen) | 0;
+  const cmdOffset = 18 + addonsLen | 0;
 
   if (cmdOffset + 3 > dataLen) return null;
   const cmd = data[cmdOffset] | 0;
@@ -267,7 +364,7 @@ function parseVLESSRequest(data) {
 
   const port = (data[cmdOffset + 1] << 8) | data[cmdOffset + 2];
 
-  const addrOffset = (cmdOffset + 3) | 0;
+  const addrOffset = cmdOffset + 3 | 0;
   if (addrOffset >= dataLen) return null;
 
   const addr = parseAddress(data, addrOffset, dataLen);
